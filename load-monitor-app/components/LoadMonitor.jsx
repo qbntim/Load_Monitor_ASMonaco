@@ -42,6 +42,9 @@ const LOAD_TYPES = [
   { key: "Recovery", short: "Recovery", color: C.teal },
 ];
 const typeColor = (t) => (LOAD_TYPES.find((x) => x.key === t) || {}).color || C.textMuted;
+// explicit "no training today" marker, stored like a session with zero load so it counts as a logged day
+const REST_TYPE = "Rest day";
+const isRest = (e) => e.type === REST_TYPE;
 
 const FONTS = `
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600;700&display=swap');
@@ -138,6 +141,17 @@ function computeMetrics(entries, wellnessEntries = []) {
   const acwr = chronicAvg > 0 ? acuteAvg / chronicAvg : 0;
   const hasAnyData = dailyLoad.some((v) => v > 0);
 
+  // Baseline: the chronic (28-day) average is only meaningful once there are 28 days of history.
+  // Before that it is diluted by days that simply weren't tracked yet, which inflates the ACWR.
+  const parseLocal = (iso) => { const [y, mo, d] = iso.split("-").map(Number); return new Date(y, mo - 1, d); };
+  const firstDate = entries.length ? entries.reduce((min, e) => (e.date < min ? e.date : min), entries[0].date) : null;
+  const baselineDays = firstDate ? Math.min(days, Math.round((today - parseLocal(firstDate)) / 86400000) + 1) : 0;
+  const acwrReady = baselineDays >= days;
+  // Gaps: days since the player started without any entry (session or rest day), looking at the
+  // 6 days before today (today may still be pending). Gaps count as zero load and understate the ACWR.
+  const loggedDates = new Set(entries.map((e) => e.date));
+  const gaps6 = firstDate ? dates.slice(-7, -1).filter((d) => d >= firstDate && !loggedDates.has(d)).length : 0;
+
   const last7Dates = dates.slice(-7);
   const last7Entries = entries.filter((e) => last7Dates.includes(e.date));
   const last7Wellness = wellnessEntries.filter((w) => last7Dates.includes(w.date));
@@ -148,16 +162,22 @@ function computeMetrics(entries, wellnessEntries = []) {
   };
   const typeBreakdown = {};
   LOAD_TYPES.forEach((t) => { typeBreakdown[t.key] = 0; });
-  last7Entries.forEach((e) => { typeBreakdown[e.type] = (typeBreakdown[e.type] || 0) + e.load; });
+  last7Entries.filter((e) => !isRest(e)).forEach((e) => { typeBreakdown[e.type] = (typeBreakdown[e.type] || 0) + e.load; });
 
   return {
     dates, dailyLoad, weeklyLoad, acuteAvg, chronicAvg, monotony, strain, acwr, hasAnyData, typeBreakdown,
+    baselineDays, acwrReady, gaps6,
     wellness: { sleepHours: avg("sleepHours"), readiness: avg("readiness"), sleep: avg("sleep"), soreness: avg("soreness"), mood: avg("mood"), stress: avg("stress") },
   };
 }
 
-function acwrZone(acwr, hasData) {
+// a player is flagged when the ACWR is in the high-risk zone (only once the 28-day baseline exists)
+// or the weekly load has been very monotonous
+const isFlagged = (m) => m.hasAnyData && ((m.acwrReady && m.acwr > 1.5) || m.monotony > 2);
+
+function acwrZone(acwr, hasData, ready = true, baselineDays = 28) {
   if (!hasData) return { label: "No data", color: C.textMuted, bg: C.surface2 };
+  if (!ready) return { label: `Baseline ${baselineDays}/28 days`, color: C.textMuted, bg: C.surface2 };
   if (acwr < 0.8) return { label: "Undertrained", color: C.blue, bg: C.blueDark };
   if (acwr <= 1.3) return { label: "Optimal range", color: C.green, bg: C.greenDark };
   if (acwr <= 1.5) return { label: "Elevated risk", color: C.amber, bg: C.amberDark };
@@ -298,6 +318,20 @@ function AcwrTrack({ acwr, hasData }) {
       </div>
       <div className="flex justify-between mt-1" style={{ fontSize: 10, color: C.textMuted, fontFamily: fontMono }}>
         <span>0.0</span><span>0.8</span><span>1.3</span><span>1.5</span><span>2.0</span>
+      </div>
+    </div>
+  );
+}
+
+function BaselineBar({ days }) {
+  const pct = Math.max(0, Math.min(100, (days / 28) * 100));
+  return (
+    <div>
+      <div style={{ height: 10, borderRadius: 6, overflow: "hidden", background: C.surface2 }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: C.textMuted }} />
+      </div>
+      <div className="mt-1" style={{ fontSize: 10, color: C.textMuted, fontFamily: fontMono }}>
+        ACWR needs 28 days of data · {days}/28
       </div>
     </div>
   );
@@ -703,6 +737,23 @@ function SessionForm({ name, onSaved }) {
     refreshToday(date);
   }, [date, refreshToday]);
 
+  const restMarked = todaySessions.some(isRest);
+  const hasRealSession = todaySessions.some((e) => !isRest(e));
+
+  const toggleRest = async () => {
+    setError("");
+    setSaving(true);
+    const entries = await getJSON(`entries:${name}`, []);
+    const updated = restMarked
+      ? entries.filter((e) => !(e.date === date && isRest(e)))
+      : [...entries, { date, type: REST_TYPE, rpe: 0, duration: 0, load: 0 }].sort((a, b) => a.date.localeCompare(b.date));
+    await setJSON(`entries:${name}`, updated);
+    setSaving(false);
+    setSaved(null);
+    refreshToday(date);
+    onSaved && onSaved();
+  };
+
   const handleSubmit = async () => {
     setError("");
     if (!type) { setError("Please select a load type."); return; }
@@ -714,7 +765,8 @@ function SessionForm({ name, onSaved }) {
     const entries = await getJSON(`entries:${name}`, []);
     const load = Math.round(rpe * dur);
     // replace an existing entry of the same type on the same day, keep other types (two-a-days)
-    const filtered = entries.filter((e) => !(e.date === date && e.type === type));
+    // a real session replaces a rest-day marker for that date
+    const filtered = entries.filter((e) => !(e.date === date && (e.type === type || isRest(e))));
     const entry = { date, type, rpe, duration: dur, load };
     const updated = [...filtered, entry].sort((a, b) => a.date.localeCompare(b.date));
     await setJSON(`entries:${name}`, updated);
@@ -746,9 +798,21 @@ function SessionForm({ name, onSaved }) {
                   <span style={{ width: 6, height: 6, borderRadius: 3, background: typeColor(e.type) }} />
                   <span style={{ fontFamily: fontBody, color: C.textMuted }}>{e.type}</span>
                 </span>
-                <span>{e.load} AU</span>
+                <span>{isRest(e) ? "no load" : `${e.load} AU`}</span>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {!hasRealSession && (
+        <div className="mb-5">
+          <button type="button" onClick={toggleRest} disabled={saving} className="w-full rounded-xl py-3 font-semibold"
+            style={{ background: restMarked ? C.surface1 : C.surface2, color: restMarked ? C.green : C.text, border: `1px solid ${restMarked ? C.green : C.border}`, fontFamily: fontDisplay, fontSize: 14 }}>
+            {restMarked ? "Marked as rest day · tap to undo" : "Rest day – no training"}
+          </button>
+          <div className="flex items-center gap-3 mt-4" style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>
+            <div style={{ flex: 1, height: 1, background: C.border }} />or log a session<div style={{ flex: 1, height: 1, background: C.border }} />
           </div>
         </div>
       )}
@@ -1227,7 +1291,7 @@ function PlayerView({ onBack }) {
             <button onClick={() => setMode("session")} className="flex items-center justify-between rounded-xl px-5 py-4" style={{ background: C.surface1, border: `1px solid ${C.border}` }}>
               <div className="text-left">
                 <div style={{ fontFamily: fontDisplay, fontWeight: 600, color: C.text, fontSize: 15 }}>Log a session</div>
-                <div style={{ fontFamily: fontBody, color: C.textMuted, fontSize: 12 }}>RPE, duration, load type</div>
+                <div style={{ fontFamily: fontBody, color: C.textMuted, fontSize: 12 }}>RPE, duration, load type · or mark a rest day</div>
               </div>
               <Activity size={20} color={C.accent} />
             </button>
@@ -1259,8 +1323,8 @@ function PlayerView({ onBack }) {
 // ---------- coach view ----------
 function PlayerCard({ name, entries, wellness, pains = [], onRemove }) {
   const m = useMemo(() => computeMetrics(entries, wellness), [entries, wellness]);
-  const zone = acwrZone(m.acwr, m.hasAnyData);
-  const flagged = m.hasAnyData && (m.acwr > 1.5 || m.monotony > 2);
+  const zone = acwrZone(m.acwr, m.hasAnyData, m.acwrReady, m.baselineDays);
+  const flagged = isFlagged(m);
 
   return (
     <div className="rounded-xl p-4" style={{ background: C.surface1, border: `1px solid ${flagged ? C.red : C.border}` }}>
@@ -1294,7 +1358,7 @@ function PlayerCard({ name, entries, wellness, pains = [], onRemove }) {
         </div>
         <div>
           <div style={{ fontFamily: fontBody, fontSize: 10, color: C.textMuted }}>ACWR</div>
-          <div style={{ fontFamily: fontMono, fontSize: 15, color: C.text, fontWeight: 600 }}>{m.hasAnyData ? m.acwr.toFixed(2) : "–"}</div>
+          <div style={{ fontFamily: fontMono, fontSize: 15, color: C.text, fontWeight: 600 }}>{m.hasAnyData && m.acwrReady ? m.acwr.toFixed(2) : "–"}</div>
         </div>
         <div>
           <div style={{ fontFamily: fontBody, fontSize: 10, color: C.textMuted }}>Monotony</div>
@@ -1302,7 +1366,15 @@ function PlayerCard({ name, entries, wellness, pains = [], onRemove }) {
         </div>
       </div>
 
-      <AcwrTrack acwr={m.acwr} hasData={m.hasAnyData} />
+      {m.hasAnyData && !m.acwrReady
+        ? <BaselineBar days={m.baselineDays} />
+        : <AcwrTrack acwr={m.acwr} hasData={m.hasAnyData} />}
+
+      {m.gaps6 > 0 && (
+        <div className="mt-2" style={{ fontFamily: fontBody, fontSize: 11, color: C.amber }}>
+          {m.gaps6} of the last 6 days not logged (no session, no rest day)
+        </div>
+      )}
 
       {m.hasAnyData && (
         <div className="mt-3 pt-3" style={{ borderTop: `1px solid ${C.border}` }}>
@@ -1520,6 +1592,7 @@ function CoachView({ onBack }) {
   const teamStats = useMemo(() => {
     const today = todayISO();
     let loggedToday = 0, totalToday = 0, atRisk = 0, withPain = 0;
+    const notLogged = [];
     const dailyByType = Array.from({ length: 28 }, () => {
       const o = {}; LOAD_TYPES.forEach((t) => { o[t.key] = 0; }); return o;
     });
@@ -1528,23 +1601,24 @@ function CoachView({ onBack }) {
       const entries = entriesByPlayer[p.name] || [];
       const todaySessions = entries.filter((e) => e.date === today);
       if (todaySessions.length) { loggedToday += 1; totalToday += todaySessions.reduce((a, e) => a + e.load, 0); }
+      else notLogged.push(p.name);
       const m = computeMetrics(entries, wellnessByPlayer[p.name] || []);
-      if (m.hasAnyData && (m.acwr > 1.5 || m.monotony > 2)) atRisk += 1;
+      if (isFlagged(m)) atRisk += 1;
       m.dates.forEach((d, i) => {
-        entries.filter((e) => e.date === d).forEach((e) => {
+        entries.filter((e) => e.date === d && !isRest(e)).forEach((e) => {
           dailyByType[i][e.type] = (dailyByType[i][e.type] || 0) + e.load;
         });
       });
     }
-    return { loggedToday, totalToday, atRisk, withPain, dailyByType };
+    return { loggedToday, totalToday, atRisk, withPain, dailyByType, notLogged };
   }, [roster, entriesByPlayer, wellnessByPlayer, painByPlayer]);
 
   const sortedRoster = useMemo(() => {
     return [...roster].sort((a, b) => {
       const ma = computeMetrics(entriesByPlayer[a.name] || [], wellnessByPlayer[a.name] || []);
       const mb = computeMetrics(entriesByPlayer[b.name] || [], wellnessByPlayer[b.name] || []);
-      const riskA = ma.hasAnyData && (ma.acwr > 1.5 || ma.monotony > 2) ? 1 : 0;
-      const riskB = mb.hasAnyData && (mb.acwr > 1.5 || mb.monotony > 2) ? 1 : 0;
+      const riskA = isFlagged(ma) ? 1 : 0;
+      const riskB = isFlagged(mb) ? 1 : 0;
       if (riskA !== riskB) return riskB - riskA;
       return a.name.localeCompare(b.name);
     });
@@ -1660,6 +1734,11 @@ function CoachView({ onBack }) {
               <div style={{ fontFamily: fontMono, fontSize: 18, color: teamStats.withPain > 0 ? C.red : C.text, fontWeight: 600 }}>{teamStats.withPain}</div>
             </div>
           </div>
+          {teamStats.notLogged.length > 0 && teamStats.notLogged.length < roster.length && (
+            <div className="mb-5" style={{ fontFamily: fontBody, fontSize: 12, color: C.amber }}>
+              Not logged yet today: {teamStats.notLogged.join(", ")}
+            </div>
+          )}
 
           <DailyBatteryOverview roster={roster} wellnessByPlayer={wellnessByPlayer} painByPlayer={painByPlayer} />
 
