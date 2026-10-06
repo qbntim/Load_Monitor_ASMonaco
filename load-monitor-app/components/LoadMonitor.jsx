@@ -82,8 +82,15 @@ function hashPin(pin) {
   return h.toString(16);
 }
 
+// local calendar date as YYYY-MM-DD (NOT toISOString, which is UTC and shifts the day around midnight in Europe)
+function toLocalISO(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return toLocalISO(new Date());
 }
 function fmtDateShort(iso) {
   const d = new Date(iso + "T00:00:00");
@@ -114,7 +121,7 @@ function computeMetrics(entries, wellnessEntries = []) {
   for (let i = 0; i < days; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() - (days - 1 - i));
-    const iso = d.toISOString().slice(0, 10);
+    const iso = toLocalISO(d);
     dates.push(iso);
     const dayTotal = entries.filter((x) => x.date === iso).reduce((a, e) => a + e.load, 0);
     dailyLoad.push(dayTotal);
@@ -145,7 +152,7 @@ function computeMetrics(entries, wellnessEntries = []) {
 
   return {
     dates, dailyLoad, weeklyLoad, acuteAvg, chronicAvg, monotony, strain, acwr, hasAnyData, typeBreakdown,
-    wellness: { sleepHours: avg("sleepHours"), sleep: avg("sleep"), soreness: avg("soreness"), mood: avg("mood"), stress: avg("stress") },
+    wellness: { sleepHours: avg("sleepHours"), readiness: avg("readiness"), sleep: avg("sleep"), soreness: avg("soreness"), mood: avg("mood"), stress: avg("stress") },
   };
 }
 
@@ -157,11 +164,19 @@ function acwrZone(acwr, hasData) {
   return { label: "High risk", color: C.red, bg: C.redDark };
 }
 
-// composite readiness score (0-100) from a single day's check-in: sleep quality + mood
-// count up, soreness + stress count down. null if no check-in that day.
+// composite battery score (0-100) from a single day's check-in: readiness, sleep quality and mood
+// count up; soreness and stress count down (inverted). Items missing from older check-ins
+// (e.g. readiness before it existed) are simply left out. null if no check-in that day.
+const isNum = (v) => typeof v === "number" && !isNaN(v);
 function batteryScore(entry) {
   if (!entry) return null;
-  const vals = [entry.sleep, entry.mood, 6 - entry.soreness, 6 - entry.stress].filter((v) => v !== undefined && v !== null);
+  const vals = [
+    entry.readiness,
+    entry.sleep,
+    entry.mood,
+    isNum(entry.soreness) ? 6 - entry.soreness : null,
+    isNum(entry.stress) ? 6 - entry.stress : null,
+  ].filter(isNum);
   if (!vals.length) return null;
   const avg1to5 = vals.reduce((a, b) => a + b, 0) / vals.length;
   return Math.round(((avg1to5 - 1) / 4) * 100);
@@ -178,6 +193,83 @@ function levelZone(value) {
   if (value <= 2) return { label: "Low", color: C.green, bg: C.greenDark };
   if (value === 3) return { label: "Moderate", color: C.amber, bg: C.amberDark };
   return { label: "High", color: C.red, bg: C.redDark };
+}
+// 1-5 scale, higher = better (sleep quality, mood)
+function qualityZone(value) {
+  if (value === undefined || value === null) return { label: "–", color: C.textMuted, bg: C.surface2 };
+  if (value >= 4) return { label: "Good", color: C.green, bg: C.greenDark };
+  if (value === 3) return { label: "Okay", color: C.amber, bg: C.amberDark };
+  return { label: "Poor", color: C.red, bg: C.redDark };
+}
+// 1-5 readiness to train, higher = more ready
+function readinessZone(value) {
+  if (value === undefined || value === null) return { label: "–", color: C.textMuted, bg: C.surface2 };
+  if (value >= 4) return { label: "High", color: C.green, bg: C.greenDark };
+  if (value === 3) return { label: "Moderate", color: C.amber, bg: C.amberDark };
+  return { label: "Low", color: C.red, bg: C.redDark };
+}
+// hours slept, higher = better (rough youth-athlete guideline: 8h+ good, 6-8h okay, <6h low)
+function sleepHoursZone(hours) {
+  if (hours === undefined || hours === null) return { label: "–", color: C.textMuted, bg: C.surface2 };
+  if (hours >= 8) return { label: "Good", color: C.green, bg: C.greenDark };
+  if (hours >= 6) return { label: "Okay", color: C.amber, bg: C.amberDark };
+  return { label: "Low", color: C.red, bg: C.redDark };
+}
+
+// ---------- pain reporting ----------
+// Structure follows common sports-medicine practice:
+//  - Intensity: Numeric Rating Scale (NRS, 0-10)
+//  - Quality: descriptors adapted from the McGill Pain Questionnaire short form (SF-MPQ) + tingling/numbness
+//  - Location, timing and onset: region + side, volleyball-specific triggers, sudden vs gradual
+// This is a monitoring aid, not a diagnostic instrument.
+const PAIN_REGIONS = [
+  { group: "Head & neck", items: [{ key: "Head", central: true }, { key: "Neck", central: true }] },
+  { group: "Upper body", items: [{ key: "Shoulder" }, { key: "Upper arm" }, { key: "Elbow" }, { key: "Forearm" }, { key: "Wrist" }, { key: "Hand / fingers" }] },
+  { group: "Trunk", items: [{ key: "Upper back", central: true }, { key: "Lower back", central: true }, { key: "Chest / ribs", central: true }, { key: "Abdomen / core", central: true }] },
+  { group: "Lower body", items: [{ key: "Hip / groin" }, { key: "Thigh (front)" }, { key: "Thigh (back)" }, { key: "Knee" }, { key: "Lower leg / calf" }, { key: "Shin" }, { key: "Ankle" }, { key: "Foot / toes" }] },
+];
+const PAIN_CENTRAL = new Set(PAIN_REGIONS.flatMap((g) => g.items.filter((i) => i.central).map((i) => i.key)));
+const PAIN_SIDES = [
+  { key: "left", label: "Left" },
+  { key: "right", label: "Right" },
+  { key: "both", label: "Both" },
+];
+const PAIN_QUALITIES = ["Throbbing", "Shooting", "Stabbing", "Sharp", "Cramping", "Burning", "Aching / dull", "Heavy", "Tender to touch", "Tingling / numb"];
+const PAIN_TIMING = [
+  "At rest", "At night", "Morning stiffness", "During warm-up", "During training", "After training",
+  "Jumping / landing", "Hitting / serving", "Diving / floor contact", "Lifting / S&C", "Running / direction changes",
+];
+const PAIN_ONSET = [
+  { key: "sudden", label: "Suddenly (a specific moment)" },
+  { key: "gradual", label: "Gradually (built up over time)" },
+];
+function painZone(intensity) {
+  if (intensity === undefined || intensity === null) return { label: "–", color: C.textMuted, bg: C.surface2 };
+  if (intensity <= 0) return { label: "None", color: C.textMuted, bg: C.surface2 };
+  if (intensity <= 3) return { label: "Mild", color: C.green, bg: C.greenDark };
+  if (intensity <= 6) return { label: "Moderate", color: C.amber, bg: C.amberDark };
+  return { label: "Severe", color: C.red, bg: C.redDark };
+}
+const painKey = (r) => `${r.region}|${r.side}`;
+// latest entry per region+side; active unless that latest entry is a "resolved" marker
+function activePains(reports) {
+  const latest = {};
+  for (const r of reports || []) {
+    const k = painKey(r);
+    if (!latest[k] || r.ts > latest[k].ts) latest[k] = r;
+  }
+  return Object.values(latest).filter((r) => r.status !== "resolved").sort((a, b) => b.intensity - a.intensity);
+}
+function painLocation(r) {
+  const side = r.side === "left" ? "left" : r.side === "right" ? "right" : r.side === "both" ? "both sides" : "";
+  return side ? `${r.region} · ${side}` : r.region;
+}
+function fmtDateTime(ts) {
+  try {
+    return new Date(ts).toLocaleString("en-GB", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return "";
+  }
 }
 
 // ---------- small UI atoms ----------
@@ -276,22 +368,36 @@ function BatteryBar({ score }) {
   );
 }
 
-function DailyBatteryRow({ name, entry }) {
+function DailyBatteryRow({ name, entry, pains = [] }) {
   const score = batteryScore(entry);
-  const zone = batteryZone(score);
+  const readiness = readinessZone(entry?.readiness);
   const soreness = levelZone(entry?.soreness);
   const stress = levelZone(entry?.stress);
+  const sleepQuality = qualityZone(entry?.sleep);
+  const sleepHours = sleepHoursZone(entry?.sleepHours);
+  const topPain = pains[0];
+  const topPainZone = topPain ? painZone(topPain.intensity) : null;
   return (
     <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg flex-wrap" style={{ background: C.surface2 }}>
       <div style={{ fontFamily: fontBody, fontSize: 13, color: C.text, fontWeight: 500, flex: "1 1 30%", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
       <BatteryBar score={score} />
-      <Badge color={soreness.color} bg={soreness.bg}>Soreness {soreness.label}</Badge>
-      <Badge color={stress.color} bg={stress.bg}>Stress {stress.label}</Badge>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {topPain && (
+          <Badge color={topPainZone.color} bg={topPainZone.bg}>
+            <AlertTriangle size={11} /> {painLocation(topPain)} {topPain.intensity}/10{pains.length > 1 ? ` +${pains.length - 1}` : ""}
+          </Badge>
+        )}
+        <Badge color={readiness.color} bg={readiness.bg}>Readiness {readiness.label}</Badge>
+        <Badge color={sleepHours.color} bg={sleepHours.bg}>Sleep {entry?.sleepHours !== null && entry?.sleepHours !== undefined ? `${entry.sleepHours}h` : "–"}</Badge>
+        <Badge color={sleepQuality.color} bg={sleepQuality.bg}>Sleep quality {sleepQuality.label}</Badge>
+        <Badge color={soreness.color} bg={soreness.bg}>Soreness {soreness.label}</Badge>
+        <Badge color={stress.color} bg={stress.bg}>Stress {stress.label}</Badge>
+      </div>
     </div>
   );
 }
 
-function DailyBatteryOverview({ roster, wellnessByPlayer }) {
+function DailyBatteryOverview({ roster, wellnessByPlayer, painByPlayer = {} }) {
   const today = todayISO();
   const rows = roster.map((p) => {
     const list = wellnessByPlayer[p.name] || [];
@@ -312,8 +418,52 @@ function DailyBatteryOverview({ roster, wellnessByPlayer }) {
         <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>{rows.filter((r) => r.entry).length}/{rows.length} checked in</div>
       </div>
       <div className="flex flex-col gap-1.5">
-        {rows.map((r) => <DailyBatteryRow key={r.name} name={r.name} entry={r.entry} />)}
+        {rows.map((r) => <DailyBatteryRow key={r.name} name={r.name} entry={r.entry} pains={activePains(painByPlayer[r.name] || [])} />)}
       </div>
+    </div>
+  );
+}
+
+function PainOverview({ roster, painByPlayer }) {
+  const rows = [];
+  for (const p of roster) {
+    for (const r of activePains(painByPlayer[p.name] || [])) rows.push({ player: p.name, report: r });
+  }
+  // strongest pain first
+  rows.sort((a, b) => b.report.intensity - a.report.intensity);
+
+  return (
+    <div className="rounded-xl p-3 mb-5" style={{ background: C.surface1, border: `1px solid ${rows.length ? C.red : C.border}` }}>
+      <div className="flex items-center justify-between mb-3">
+        <div style={{ fontFamily: fontBody, fontSize: 12, color: C.textMuted }}>Active pain reports</div>
+        <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>{rows.length} active</div>
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ fontFamily: fontBody, fontSize: 13, color: C.textMuted }}>No active pain reports.</div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          {rows.map(({ player, report: r }) => {
+            const z = painZone(r.intensity);
+            return (
+              <div key={`${player}|${painKey(r)}`} className="px-3 py-2.5 rounded-lg" style={{ background: C.surface2 }}>
+                <div className="flex items-center gap-2 flex-wrap mb-1">
+                  <span style={{ fontFamily: fontBody, fontSize: 13, color: C.text, fontWeight: 600 }}>{player}</span>
+                  <span style={{ fontFamily: fontBody, fontSize: 13, color: C.text }}>{painLocation(r)}</span>
+                  <Badge color={z.color} bg={z.bg}>{r.intensity}/10 · {z.label}</Badge>
+                </div>
+                <div style={{ fontFamily: fontBody, fontSize: 12, color: C.textMuted }}>
+                  {(r.qualities || []).join(", ")} · {(r.timing || []).join(", ")}
+                  {r.onset ? ` · ${r.onset === "sudden" ? "sudden onset" : "gradual onset"}` : ""}
+                </div>
+                {r.note ? (
+                  <div style={{ fontFamily: fontBody, fontSize: 12, color: C.text, fontStyle: "italic", marginTop: 2 }}>“{r.note}”</div>
+                ) : null}
+                <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted, marginTop: 2 }}>Last update {fmtDateTime(r.ts)}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -419,6 +569,7 @@ function Landing({ onSelect }) {
 function WellnessForm({ name, onSaved }) {
   const [date, setDate] = useState(todayISO());
   const [sleepHours, setSleepHours] = useState("");
+  const [readiness, setReadiness] = useState(3);
   const [sleep, setSleep] = useState(3);
   const [soreness, setSoreness] = useState(3);
   const [mood, setMood] = useState(3);
@@ -432,6 +583,7 @@ function WellnessForm({ name, onSaved }) {
       const list = await getJSON(`wellness:${name}`, []);
       const existing = list.find((w) => w.date === date);
       setSleepHours(existing?.sleepHours !== undefined && existing?.sleepHours !== null ? String(existing.sleepHours) : "");
+      setReadiness(existing?.readiness ?? 3);
       setSleep(existing?.sleep ?? 3);
       setSoreness(existing?.soreness ?? 3);
       setMood(existing?.mood ?? 3);
@@ -450,7 +602,7 @@ function WellnessForm({ name, onSaved }) {
     setSaving(true);
     const list = await getJSON(`wellness:${name}`, []);
     const filtered = list.filter((w) => w.date !== date);
-    const entry = { date, sleepHours: sleepHours === "" ? null : hours, sleep, soreness, mood, stress };
+    const entry = { date, sleepHours: sleepHours === "" ? null : hours, readiness, sleep, soreness, mood, stress };
     const updated = [...filtered, entry].sort((a, b) => a.date.localeCompare(b.date));
     await setJSON(`wellness:${name}`, updated);
     setSaving(false);
@@ -489,6 +641,13 @@ function WellnessForm({ name, onSaved }) {
       </div>
 
       <div className="flex flex-col gap-5 mb-5">
+        <div className="rounded-xl p-3" style={{ background: C.surface1, border: `1px solid ${C.border}` }}>
+          <div className="mb-1" style={{ color: C.text, fontSize: 13, fontFamily: fontBody, fontWeight: 500 }}>Readiness</div>
+          <div className="mb-2" style={{ color: C.textMuted, fontSize: 12, fontFamily: fontBody }}>
+            How ready do you feel to train today, regardless of how long you slept? (1 not ready at all – 5 fully ready)
+          </div>
+          <ScaleButtons value={readiness} onChange={setReadiness} />
+        </div>
         <div>
           <div className="mb-2" style={{ color: C.textMuted, fontSize: 12, fontFamily: fontBody }}>Sleep quality (1 poor – 5 great)</div>
           <ScaleButtons value={sleep} onChange={setSleep} />
@@ -637,6 +796,299 @@ function SessionForm({ name, onSaved }) {
   );
 }
 
+function Chip({ selected, onClick, children, color = C.accent }) {
+  return (
+    <button type="button" onClick={onClick} className="rounded-lg px-3 py-2 text-sm font-medium"
+      style={{ fontFamily: fontBody, background: selected ? color : C.surface1, color: selected ? C.onRed : C.text, border: `1px solid ${selected ? color : C.border}` }}>
+      {children}
+    </button>
+  );
+}
+
+function PainForm({ name, prefill, onSaved, onCancel }) {
+  const [region, setRegion] = useState(prefill?.region || "");
+  const [side, setSide] = useState(prefill?.side || "");
+  const [intensity, setIntensity] = useState(prefill ? prefill.intensity : null);
+  const [qualities, setQualities] = useState(prefill?.qualities || []);
+  const [timing, setTiming] = useState(prefill?.timing || []);
+  const [onset, setOnset] = useState(prefill?.onset || "");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggle = (list, setList, v) => setList(list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
+  const central = PAIN_CENTRAL.has(region);
+  const severe = (intensity !== null && intensity >= 7) || qualities.includes("Tingling / numb");
+
+  const submit = async () => {
+    setError("");
+    if (!region) { setError("Please select where it hurts."); return; }
+    if (!central && !side) { setError("Please select the side (left, right or both)."); return; }
+    if (intensity === null) { setError("Please rate the pain intensity."); return; }
+    if (intensity === 0) { setError("0 means no pain. If the pain is gone, go back and tap “Mark as resolved” instead."); return; }
+    if (!qualities.length) { setError("Please select at least one pain type."); return; }
+    if (!timing.length) { setError("Please select when the pain occurs."); return; }
+
+    setSaving(true);
+    const list = await getJSON(`pain:${name}`, []);
+    const now = new Date();
+    const report = {
+      id: `${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
+      ts: now.toISOString(),
+      date: todayISO(),
+      region,
+      side: central ? "central" : side,
+      intensity,
+      qualities,
+      timing,
+      onset: onset || null,
+      note: note.trim(),
+      status: "active",
+    };
+    const ok = await setJSON(`pain:${name}`, [...list, report]);
+    setSaving(false);
+    if (!ok) { setError("Could not save. Please try again."); return; }
+    onSaved();
+  };
+
+  const label = (t) => (
+    <div className="mb-2" style={{ color: C.textMuted, fontSize: 12, fontFamily: fontBody }}>{t}</div>
+  );
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: fontDisplay, fontWeight: 600, color: C.text, fontSize: 20, marginBottom: 4 }}>
+        {prefill ? "Update pain report" : "Report pain"}
+      </h2>
+      <p style={{ fontFamily: fontBody, color: C.textMuted, fontSize: 13, marginBottom: 20 }}>
+        You can report pain at any time. It takes about a minute.
+      </p>
+
+      <div className="mb-5">
+        {label("1 · Where does it hurt?")}
+        <div className="flex flex-col gap-3">
+          {PAIN_REGIONS.map((g) => (
+            <div key={g.group}>
+              <div style={{ color: C.textMuted, fontSize: 11, fontFamily: fontBody, marginBottom: 4 }}>{g.group}</div>
+              <div className="flex flex-wrap gap-2">
+                {g.items.map((i) => (
+                  <Chip key={i.key} selected={region === i.key} onClick={() => { setRegion(i.key); if (i.central) setSide(""); }}>{i.key}</Chip>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        {region && !central && (
+          <div className="mt-3">
+            <div style={{ color: C.textMuted, fontSize: 11, fontFamily: fontBody, marginBottom: 4 }}>Side</div>
+            <div className="flex gap-2">
+              {PAIN_SIDES.map((s) => (
+                <Chip key={s.key} selected={side === s.key} onClick={() => setSide(s.key)}>{s.label}</Chip>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="mb-5">
+        {label("2 · How strong is the pain? (0 no pain – 10 worst pain imaginable)")}
+        <div className="grid grid-cols-6 gap-2 mb-2">
+          {Array.from({ length: 11 }, (_, i) => i).map((n) => (
+            <button key={n} type="button" onClick={() => setIntensity(n)} className="rounded-lg py-2 text-sm font-semibold"
+              style={{ fontFamily: fontMono, background: intensity === n ? C.accent : C.surface1, color: intensity === n ? C.onRed : C.text, border: `1px solid ${intensity === n ? C.accent : C.border}` }}>
+              {n}
+            </button>
+          ))}
+        </div>
+        <div style={{ fontFamily: fontBody, fontSize: 12, color: C.textMuted, minHeight: 16 }}>
+          {intensity !== null ? painZone(intensity).label : "Tap a number"}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        {label("3 · What does it feel like? (select all that apply)")}
+        <div className="flex flex-wrap gap-2">
+          {PAIN_QUALITIES.map((q) => (
+            <Chip key={q} selected={qualities.includes(q)} onClick={() => toggle(qualities, setQualities, q)}>{q}</Chip>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        {label("4 · When does the pain occur? (select all that apply)")}
+        <div className="flex flex-wrap gap-2">
+          {PAIN_TIMING.map((t) => (
+            <Chip key={t} selected={timing.includes(t)} onClick={() => toggle(timing, setTiming, t)}>{t}</Chip>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        {label("5 · How did it start? (optional)")}
+        <div className="flex flex-col gap-2">
+          {PAIN_ONSET.map((o) => (
+            <Chip key={o.key} selected={onset === o.key} onClick={() => setOnset(onset === o.key ? "" : o.key)}>{o.label}</Chip>
+          ))}
+        </div>
+      </div>
+
+      <div className="mb-5">
+        {label("6 · Anything else the staff should know? (optional)")}
+        <textarea
+          value={note} onChange={(e) => setNote(e.target.value.slice(0, 300))} rows={3}
+          className="rounded-lg px-3 py-2 w-full"
+          style={{ background: C.surface1, color: C.text, border: `1px solid ${C.border}`, fontFamily: fontBody, fontSize: 14 }}
+        />
+      </div>
+
+      {severe && (
+        <div className="rounded-xl p-3 mb-4" style={{ background: C.redDark, color: C.red, fontFamily: fontBody, fontSize: 13 }}>
+          This sounds significant. Please also tell the physio or medical staff directly – this tool is for monitoring and does not replace a medical assessment.
+        </div>
+      )}
+
+      {error && <div style={{ color: C.red, fontFamily: fontBody, fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
+      <button onClick={submit} disabled={saving} className="w-full rounded-xl py-3 font-semibold"
+        style={{ background: C.accent, color: C.onRed, fontFamily: fontDisplay, fontSize: 15 }}>
+        {saving ? "Saving…" : "Send pain report"}
+      </button>
+      <button onClick={onCancel} className="w-full mt-2 py-2" style={{ color: C.textMuted, fontFamily: fontBody, fontSize: 13 }}>Cancel</button>
+
+      <p style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted, marginTop: 12, textAlign: "center" }}>
+        Your report is visible to the coaching and medical staff.
+      </p>
+    </div>
+  );
+}
+
+function PainSection({ name, onChanged }) {
+  const [view, setView] = useState("list"); // list | form
+  const [reports, setReports] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [prefill, setPrefill] = useState(null);
+  const [busyKey, setBusyKey] = useState("");
+
+  const load = useCallback(async () => {
+    setReports(await getJSON(`pain:${name}`, []));
+    setLoading(false);
+  }, [name]);
+  useEffect(() => { load(); }, [load]);
+
+  const active = useMemo(() => activePains(reports), [reports]);
+
+  const resolve = async (r) => {
+    setBusyKey(painKey(r));
+    const list = await getJSON(`pain:${name}`, []);
+    const now = new Date();
+    const marker = {
+      id: `${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
+      ts: now.toISOString(), date: todayISO(),
+      region: r.region, side: r.side, intensity: 0, status: "resolved",
+    };
+    await setJSON(`pain:${name}`, [...list, marker]);
+    setBusyKey("");
+    await load();
+    onChanged && onChanged();
+  };
+
+  if (loading) return <div style={{ color: C.textMuted, fontFamily: fontBody }}>Loading…</div>;
+
+  if (view === "form") {
+    return (
+      <PainForm
+        name={name} prefill={prefill}
+        onCancel={() => setView("list")}
+        onSaved={async () => { setView("list"); await load(); onChanged && onChanged(); }}
+      />
+    );
+  }
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: fontDisplay, fontWeight: 600, color: C.text, fontSize: 20, marginBottom: 4 }}>Pain reports</h2>
+      <p style={{ fontFamily: fontBody, color: C.textMuted, fontSize: 13, marginBottom: 16 }}>
+        Report new pain at any time, update how it develops, and mark it as resolved when it's gone.
+      </p>
+
+      <button onClick={() => { setPrefill(null); setView("form"); }} className="w-full rounded-xl py-3 font-semibold mb-5"
+        style={{ background: C.accent, color: C.onRed, fontFamily: fontDisplay, fontSize: 15 }}>
+        Report new pain
+      </button>
+
+      <div style={{ fontFamily: fontBody, fontSize: 12, color: C.textMuted, marginBottom: 8 }}>
+        Active ({active.length})
+      </div>
+      {active.length === 0 ? (
+        <div className="rounded-xl p-4" style={{ background: C.surface1, border: `1px solid ${C.border}`, fontFamily: fontBody, fontSize: 13, color: C.textMuted }}>
+          No active pain reports.
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {active.map((r) => {
+            const z = painZone(r.intensity);
+            return (
+              <div key={painKey(r)} className="rounded-xl p-4" style={{ background: C.surface1, border: `1px solid ${C.border}` }}>
+                <div className="flex items-start justify-between gap-2 mb-2">
+                  <div style={{ fontFamily: fontDisplay, fontWeight: 600, fontSize: 15, color: C.text }}>{painLocation(r)}</div>
+                  <Badge color={z.color} bg={z.bg}>{r.intensity}/10 · {z.label}</Badge>
+                </div>
+                <div style={{ fontFamily: fontBody, fontSize: 12, color: C.textMuted, marginBottom: 6 }}>
+                  {(r.qualities || []).join(", ")} · {(r.timing || []).join(", ")}
+                </div>
+                <div className="mb-3" style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>
+                  Last update {fmtDateTime(r.ts)}
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => { setPrefill(r); setView("form"); }} className="flex-1 rounded-lg py-2 text-sm font-medium"
+                    style={{ background: C.surface2, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody }}>
+                    Update
+                  </button>
+                  <button onClick={() => resolve(r)} disabled={busyKey === painKey(r)} className="flex-1 rounded-lg py-2 text-sm font-medium"
+                    style={{ background: C.greenDark, border: `1px solid ${C.border}`, color: C.green, fontFamily: fontBody }}>
+                    {busyKey === painKey(r) ? "Saving…" : "Mark as resolved"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChangePinForm({ name, roster, setRoster, onDone }) {
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+
+  const submit = async (pin) => {
+    const updated = roster.map((p) => (p.name === name ? { ...p, pinHash: hashPin(pin) } : p));
+    setRoster(updated);
+    const ok = await setJSON("roster", updated);
+    if (ok) { setDone(true); setError(""); }
+    else setError("Could not save. Try again.");
+  };
+
+  if (done) {
+    return (
+      <div>
+        <div className="flex items-center gap-2 mb-4">
+          <Check size={16} color={C.green} />
+          <span style={{ fontFamily: fontBody, color: C.text, fontSize: 13 }}>PIN updated. Use it next time you log in.</span>
+        </div>
+        <button onClick={onDone} className="rounded-xl px-4 py-2" style={{ background: C.surface1, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody, fontSize: 13 }}>
+          Back
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <PinPad title="Set a new PIN" subtitle="Pick a new 4+ digit PIN. It replaces your old one immediately." needsConfirm confirmLabel="Save new PIN" onSubmit={submit} error={error} onBack={onDone} />
+  );
+}
+
 function PlayerView({ onBack }) {
   const [roster, setRoster] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -645,8 +1097,9 @@ function PlayerView({ onBack }) {
   const [newName, setNewName] = useState("");
   const [authed, setAuthed] = useState(false);
   const [authError, setAuthError] = useState("");
-  const [mode, setMode] = useState("hub"); // hub | wellness | session
+  const [mode, setMode] = useState("hub"); // hub | wellness | session | pain | pin
   const [checkedInToday, setCheckedInToday] = useState(false);
+  const [activePainCount, setActivePainCount] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -661,7 +1114,12 @@ function PlayerView({ onBack }) {
     setCheckedInToday(list.some((w) => w.date === todayISO()));
   }, [name]);
 
-  useEffect(() => { if (authed) refreshCheckin(); }, [authed, refreshCheckin]);
+  const refreshPain = useCallback(async () => {
+    const list = await getJSON(`pain:${name}`, []);
+    setActivePainCount(activePains(list).length);
+  }, [name]);
+
+  useEffect(() => { if (authed) { refreshCheckin(); refreshPain(); } }, [authed, refreshCheckin, refreshPain]);
 
   const registerNewPlayer = async (pin) => {
     const trimmed = newName.trim();
@@ -773,18 +1231,33 @@ function PlayerView({ onBack }) {
               </div>
               <Activity size={20} color={C.accent} />
             </button>
+            <button onClick={() => setMode("pain")} className="flex items-center justify-between rounded-xl px-5 py-4" style={{ background: C.surface1, border: `1px solid ${activePainCount > 0 ? C.red : C.border}` }}>
+              <div className="text-left">
+                <div style={{ fontFamily: fontDisplay, fontWeight: 600, color: C.text, fontSize: 15 }}>Report pain</div>
+                <div style={{ fontFamily: fontBody, color: C.textMuted, fontSize: 12 }}>
+                  {activePainCount > 0 ? `${activePainCount} active — tap to update or resolve` : "Anytime: where, how strong, what type, when"}
+                </div>
+              </div>
+              <AlertTriangle size={20} color={activePainCount > 0 ? C.red : C.brand} />
+            </button>
           </div>
+
+          <button onClick={() => setMode("pin")} className="flex items-center gap-2 mt-6" style={{ color: C.textMuted, fontFamily: fontBody, fontSize: 12 }}>
+            <KeyRound size={13} /> Change my PIN
+          </button>
         </>
       )}
 
       {mode === "wellness" && <WellnessForm name={name} onSaved={refreshCheckin} />}
       {mode === "session" && <SessionForm name={name} />}
+      {mode === "pain" && <PainSection name={name} onChanged={refreshPain} />}
+      {mode === "pin" && <ChangePinForm name={name} roster={roster} setRoster={setRoster} onDone={() => setMode("hub")} />}
     </div>
   );
 }
 
 // ---------- coach view ----------
-function PlayerCard({ name, entries, wellness, onRemove }) {
+function PlayerCard({ name, entries, wellness, pains = [], onRemove }) {
   const m = useMemo(() => computeMetrics(entries, wellness), [entries, wellness]);
   const zone = acwrZone(m.acwr, m.hasAnyData);
   const flagged = m.hasAnyData && (m.acwr > 1.5 || m.monotony > 2);
@@ -798,6 +1271,19 @@ function PlayerCard({ name, entries, wellness, onRemove }) {
         </div>
         <button onClick={() => onRemove(name)} title="Remove from roster"><Trash2 size={14} color={C.textMuted} /></button>
       </div>
+
+      {pains.length > 0 && (
+        <div className="flex flex-col gap-1 mb-3">
+          {pains.map((r) => {
+            const z = painZone(r.intensity);
+            return (
+              <Badge key={painKey(r)} color={z.color} bg={z.bg}>
+                <AlertTriangle size={11} /> {painLocation(r)} · {r.intensity}/10
+              </Badge>
+            );
+          })}
+        </div>
+      )}
 
       <Sparkline data={m.dailyLoad} />
 
@@ -825,8 +1311,9 @@ function PlayerCard({ name, entries, wellness, onRemove }) {
         </div>
       )}
 
-      {(m.wellness.sleepHours || m.wellness.sleep || m.wellness.soreness || m.wellness.mood || m.wellness.stress) && (
+      {(m.wellness.sleepHours || m.wellness.readiness || m.wellness.sleep || m.wellness.soreness || m.wellness.mood || m.wellness.stress) && (
         <div className="flex gap-3 mt-3 pt-3 flex-wrap" style={{ borderTop: `1px solid ${C.border}` }}>
+          {m.wellness.readiness !== null && <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>Readiness <span style={{ fontFamily: fontMono, color: C.text }}>{m.wellness.readiness.toFixed(1)}</span></div>}
           {m.wellness.sleepHours !== null && <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>Sleep <span style={{ fontFamily: fontMono, color: C.text }}>{m.wellness.sleepHours.toFixed(1)}h</span></div>}
           {m.wellness.sleep !== null && <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>Sleep quality <span style={{ fontFamily: fontMono, color: C.text }}>{m.wellness.sleep.toFixed(1)}</span></div>}
           {m.wellness.soreness !== null && <div style={{ fontFamily: fontBody, fontSize: 11, color: C.textMuted }}>Soreness <span style={{ fontFamily: fontMono, color: C.text }}>{m.wellness.soreness.toFixed(1)}</span></div>}
@@ -877,6 +1364,7 @@ function CoachView({ onBack }) {
   const [roster, setRoster] = useState([]);
   const [entriesByPlayer, setEntriesByPlayer] = useState({});
   const [wellnessByPlayer, setWellnessByPlayer] = useState({});
+  const [painByPlayer, setPainByPlayer] = useState({});
   const [loading, setLoading] = useState(true);
   const [newPlayer, setNewPlayer] = useState("");
   const [rosterOpen, setRosterOpen] = useState(false);
@@ -897,13 +1385,15 @@ function CoachView({ onBack }) {
     setLoading(true);
     const r = normalizeRoster(await getJSON("roster", []));
     setRoster(r);
-    const eMap = {}, wMap = {};
+    const eMap = {}, wMap = {}, pMap = {};
     for (const p of r) {
       eMap[p.name] = await getJSON(`entries:${p.name}`, []);
       wMap[p.name] = await getJSON(`wellness:${p.name}`, []);
+      pMap[p.name] = await getJSON(`pain:${p.name}`, []);
     }
     setEntriesByPlayer(eMap);
     setWellnessByPlayer(wMap);
+    setPainByPlayer(pMap);
     setLoading(false);
   }, []);
 
@@ -981,7 +1471,12 @@ function CoachView({ onBack }) {
   };
 
   const downloadCSV = (filename, rows) => {
-    const csv = rows.map((r) => r.join(";")).join("\n");
+    // quote cells that contain the separator, quotes or line breaks (free-text notes!); BOM keeps umlauts intact in Excel
+    const esc = (v) => {
+      const s = v === null || v === undefined ? "" : String(v);
+      return /[;"\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const csv = "﻿" + rows.map((r) => r.map(esc).join(";")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1000,22 +1495,36 @@ function CoachView({ onBack }) {
   };
 
   const exportWellnessCSV = () => {
-    const rows = [["Name", "Date", "Sleep_hours", "Sleep_quality", "Soreness", "Mood", "Stress"]];
+    const rows = [["Name", "Date", "Readiness", "Sleep_hours", "Sleep_quality", "Soreness", "Mood", "Stress"]];
     for (const p of roster) {
       for (const w of wellnessByPlayer[p.name] || []) {
-        rows.push([p.name, w.date, w.sleepHours ?? "", w.sleep, w.soreness, w.mood, w.stress]);
+        rows.push([p.name, w.date, w.readiness ?? "", w.sleepHours ?? "", w.sleep, w.soreness, w.mood, w.stress]);
       }
     }
     downloadCSV(`load-monitor-wellness-${todayISO()}.csv`, rows);
   };
 
+  const exportPainCSV = () => {
+    const rows = [["Name", "Date", "Time_reported", "Region", "Side", "Status", "Intensity_NRS_0_10", "Pain_type", "When_it_occurs", "Onset", "Note"]];
+    for (const p of roster) {
+      for (const r of painByPlayer[p.name] || []) {
+        rows.push([
+          p.name, r.date, fmtDateTime(r.ts), r.region, r.side, r.status || "active", r.intensity,
+          (r.qualities || []).join(" | "), (r.timing || []).join(" | "), r.onset || "", r.note || "",
+        ]);
+      }
+    }
+    downloadCSV(`load-monitor-pain-${todayISO()}.csv`, rows);
+  };
+
   const teamStats = useMemo(() => {
     const today = todayISO();
-    let loggedToday = 0, totalToday = 0, atRisk = 0;
+    let loggedToday = 0, totalToday = 0, atRisk = 0, withPain = 0;
     const dailyByType = Array.from({ length: 28 }, () => {
       const o = {}; LOAD_TYPES.forEach((t) => { o[t.key] = 0; }); return o;
     });
     for (const p of roster) {
+      if (activePains(painByPlayer[p.name] || []).length) withPain += 1;
       const entries = entriesByPlayer[p.name] || [];
       const todaySessions = entries.filter((e) => e.date === today);
       if (todaySessions.length) { loggedToday += 1; totalToday += todaySessions.reduce((a, e) => a + e.load, 0); }
@@ -1027,8 +1536,8 @@ function CoachView({ onBack }) {
         });
       });
     }
-    return { loggedToday, totalToday, atRisk, dailyByType };
-  }, [roster, entriesByPlayer, wellnessByPlayer]);
+    return { loggedToday, totalToday, atRisk, withPain, dailyByType };
+  }, [roster, entriesByPlayer, wellnessByPlayer, painByPlayer]);
 
   const sortedRoster = useMemo(() => {
     return [...roster].sort((a, b) => {
@@ -1043,7 +1552,7 @@ function CoachView({ onBack }) {
 
   const chartData = teamStats.dailyByType.map((dayTypes, i) => {
     const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - (27 - i));
-    return { label: fmtDateShort(d.toISOString().slice(0, 10)), ...dayTypes };
+    return { label: fmtDateShort(toLocalISO(d)), ...dayTypes };
   });
 
   if (pinLoading) return <div style={{ padding: "2rem 1rem", color: C.textMuted, fontFamily: fontBody }}>Loading…</div>;
@@ -1121,6 +1630,9 @@ function CoachView({ onBack }) {
           <button onClick={exportWellnessCSV} className="flex items-center gap-1 rounded-lg px-3 py-1.5" style={{ background: C.surface1, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody, fontSize: 12 }}>
             <Download size={13} /> Wellness
           </button>
+          <button onClick={exportPainCSV} className="flex items-center gap-1 rounded-lg px-3 py-1.5" style={{ background: C.surface1, border: `1px solid ${C.border}`, color: C.text, fontFamily: fontBody, fontSize: 12 }}>
+            <Download size={13} /> Pain
+          </button>
         </div>
       </div>
 
@@ -1130,7 +1642,7 @@ function CoachView({ onBack }) {
         <div style={{ color: C.textMuted, fontFamily: fontBody }}>Loading data…</div>
       ) : (
         <>
-          <div className="grid grid-cols-3 gap-2 mb-5">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-5">
             <div className="rounded-xl p-3" style={{ background: C.surface1 }}>
               <div style={{ fontFamily: fontBody, fontSize: 10, color: C.textMuted }}>Logged today</div>
               <div style={{ fontFamily: fontMono, fontSize: 18, color: C.text, fontWeight: 600 }}>{teamStats.loggedToday}/{roster.length}</div>
@@ -1143,9 +1655,15 @@ function CoachView({ onBack }) {
               <div style={{ fontFamily: fontBody, fontSize: 10, color: C.textMuted }}>At risk</div>
               <div style={{ fontFamily: fontMono, fontSize: 18, color: teamStats.atRisk > 0 ? C.red : C.text, fontWeight: 600 }}>{teamStats.atRisk}</div>
             </div>
+            <div className="rounded-xl p-3" style={{ background: C.surface1 }}>
+              <div style={{ fontFamily: fontBody, fontSize: 10, color: C.textMuted }}>Players with pain</div>
+              <div style={{ fontFamily: fontMono, fontSize: 18, color: teamStats.withPain > 0 ? C.red : C.text, fontWeight: 600 }}>{teamStats.withPain}</div>
+            </div>
           </div>
 
-          <DailyBatteryOverview roster={roster} wellnessByPlayer={wellnessByPlayer} />
+          <DailyBatteryOverview roster={roster} wellnessByPlayer={wellnessByPlayer} painByPlayer={painByPlayer} />
+
+          <PainOverview roster={roster} painByPlayer={painByPlayer} />
 
           <div className="rounded-xl p-3 mb-5" style={{ background: C.surface1, border: `1px solid ${C.border}` }}>
             <div className="flex items-center justify-between mb-2">
@@ -1239,7 +1757,7 @@ function CoachView({ onBack }) {
           ) : (
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
               {sortedRoster.map((p) => (
-                <PlayerCard key={p.name} name={p.name} entries={entriesByPlayer[p.name] || []} wellness={wellnessByPlayer[p.name] || []} onRemove={removePlayer} />
+                <PlayerCard key={p.name} name={p.name} entries={entriesByPlayer[p.name] || []} wellness={wellnessByPlayer[p.name] || []} pains={activePains(painByPlayer[p.name] || [])} onRemove={removePlayer} />
               ))}
             </div>
           )}
